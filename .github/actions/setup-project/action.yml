@@ -1,0 +1,89 @@
+# =============================================================================
+# LOCAL COMPOSITE ACTION: setup-project
+# =============================================================================
+# Composite actions allow you to bundle multiple steps into a single reusable
+# action that can be called from any workflow in this repository (or others).
+# This is different from reusable workflows — composite actions are used as
+# a single step, while reusable workflows run as a full job.
+# =============================================================================
+
+name: "Setup Project"
+description: "Sets up the Node.js environment and optionally installs dependencies for the project"
+
+# INPUTS: Parameters that callers can pass into this composite action
+inputs:
+  node-version:
+    description: "The Node.js version to use"
+    required: false
+    default: "20"
+  install-deps:
+    description: "Whether to install npm dependencies"
+    required: false
+    default: "true"
+  cache-key-prefix:
+    description: "Prefix for the npm cache key (useful for matrix builds)"
+    required: false
+    default: "npm"
+
+# OUTPUTS: Values that this composite action exposes to calling workflows
+outputs:
+  node-version-used:
+    description: "The exact Node.js version that was installed"
+    # Composite action outputs reference steps by their id
+    value: ${{ steps.setup-node.outputs.node-version }}
+  cache-hit:
+    description: "Whether the npm cache was restored"
+    value: ${{ steps.cache-npm.outputs.cache-hit }}
+
+# The 'runs' section defines what the composite action does
+runs:
+  using: "composite" # Marks this as a composite action (vs. JavaScript or Docker action)
+  steps:
+    # Step 1: Check out code (in case it hasn't been checked out yet)
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # Step 2: Set up the requested Node.js version
+    # The 'id' allows later steps (and outputs) to reference this step's outputs
+    - name: Set up Node.js
+      id: setup-node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    # Step 3: Cache node_modules based on package-lock.json hash
+    # This dramatically speeds up workflows by avoiding re-downloading packages
+    - name: Cache npm dependencies
+      id: cache-npm
+      if: inputs.install-deps == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        # Cache key: invalidated when package-lock.json changes
+        key: ${{ inputs.cache-key-prefix }}-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('**/package-lock.json') }}
+        # Fallback keys (partial matches) for cache restoration
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-node${{ inputs.node-version }}-
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-
+
+    # Step 4: Install npm dependencies (conditional based on input)
+    - name: Install dependencies
+      if: inputs.install-deps == 'true'
+      # Shell must be specified in composite action steps
+      shell: bash
+      run: |
+        echo "Installing npm dependencies..."
+        npm ci
+        echo "Dependencies installed successfully"
+
+    # Step 5: Print environment info for debugging
+    - name: Print environment info
+      shell: bash
+      run: |
+        echo "=== Environment Information ==="
+        echo "Node.js version: $(node --version)"
+        echo "npm version: $(npm --version)"
+        echo "Operating System: ${{ runner.os }}"
+        echo "Architecture: ${{ runner.arch }}"
+        echo "Cache hit: ${{ steps.cache-npm.outputs.cache-hit }}"
+        echo "=============================="

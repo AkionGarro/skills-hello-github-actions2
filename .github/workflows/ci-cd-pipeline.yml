@@ -1,0 +1,482 @@
+# =============================================================================
+# MAIN CI/CD PIPELINE WORKFLOW
+# =============================================================================
+# This workflow demonstrates the full breadth of GitHub Actions features:
+# - Multiple trigger types (push, pull_request, workflow_dispatch)
+# - Manual dispatch inputs
+# - Path filters
+# - Concurrency control
+# - Job dependencies (needs:)
+# - Matrix strategy with multiple OS and Node versions
+# - Caching for faster builds
+# - Artifacts (upload & download)
+# - Container jobs and services
+# - Job outputs passed between jobs
+# - Environment deployments with protection rules
+# - Permissions management
+# - Conditional execution (if:)
+# - continue-on-error for non-critical steps
+# - Composite action usage
+# =============================================================================
+
+name: CI/CD Pipeline
+
+# =============================================================================
+# TRIGGERS
+# Multiple event triggers show how workflows can respond to different events.
+# =============================================================================
+on:
+  # Run on every push to main or any feature branch
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "fix/**"
+    # PATH FILTERS: Only run when these files change, saving CI minutes
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/ci-cd-pipeline.yml"
+
+  # Run on pull requests targeting main
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "package.json"
+      - "package-lock.json"
+
+  # WORKFLOW_DISPATCH: Allows manual triggering with custom inputs from the UI
+  # Navigate to Actions tab → CI/CD Pipeline → Run workflow
+  workflow_dispatch:
+    inputs:
+      # Input type: choice (dropdown selector)
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      # Input type: boolean (checkbox)
+      debug_mode:
+        description: "Enable debug mode (verbose logging)"
+        required: false
+        default: false
+        type: boolean
+      # Input type: string (free text)
+      version_override:
+        description: "Override the version tag (e.g. 1.2.3). Leave empty to auto-generate."
+        required: false
+        type: string
+
+# =============================================================================
+# CONCURRENCY
+# Prevents multiple runs of the same workflow on the same branch from running
+# simultaneously. For non-main branches, cancels any in-progress run when a
+# new one starts (saves CI minutes). For main, allows runs to queue.
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# =============================================================================
+# WORKFLOW-LEVEL ENVIRONMENT VARIABLES
+# Available to all jobs and steps in this workflow.
+# =============================================================================
+env:
+  NODE_ENV: test
+  APP_NAME: skills-hello-github-actions2
+  REGISTRY: ghcr.io
+
+# =============================================================================
+# WORKFLOW-LEVEL PERMISSIONS
+# Follow principle of least privilege. Override per-job as needed.
+# =============================================================================
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1: lint
+  # Runs ESLint to catch code style and potential errors early.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: "Lint (ESLint)"
+    runs-on: ubuntu-latest
+
+    # JOB-LEVEL PERMISSIONS: Override workflow-level for this specific job
+    permissions:
+      contents: read
+
+    steps:
+      # CHECKOUT: Always the first step — checks out your repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # COMPOSITE ACTION: Uses our local composite action defined in
+      # .github/actions/setup-project/action.yml
+      - name: Setup project environment
+        uses: ./.github/actions/setup-project
+        with:
+          node-version: "20"
+          install-deps: "true"
+          cache-key-prefix: "lint"
+
+      # Run ESLint — continue-on-error means this step won't fail the job,
+      # but its result is still visible in the UI
+      - name: Run ESLint
+        id: eslint
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Running ESLint..."
+          npm run lint || echo "::warning::ESLint found issues, check the output above"
+
+      # STEP OUTPUTS: Share data between steps using $GITHUB_OUTPUT
+      - name: Set lint status output
+        id: lint-status
+        shell: bash
+        run: |
+          if [ "${{ steps.eslint.outcome }}" == "success" ]; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+            echo "::notice::Lint passed successfully"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "::warning::Lint completed with warnings"
+          fi
+
+      # Demonstrate multi-line run scripts with bash shell specification
+      - name: Summary report
+        shell: bash
+        run: |
+          echo "=== Lint Summary ==="
+          echo "ESLint outcome: ${{ steps.eslint.outcome }}"
+          echo "Lint status: ${{ steps.lint-status.outputs.status }}"
+          echo ""
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "===================="
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: test
+  # Runs Jest tests across a MATRIX of Node.js versions and operating systems.
+  # ---------------------------------------------------------------------------
+  test:
+    name: "Test (Node ${{ matrix.node-version }} / ${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+
+    # MATRIX STRATEGY: Run this job for every combination of the matrix values.
+    # This results in 3 × 2 = 6 parallel jobs.
+    strategy:
+      # fail-fast: false means all matrix jobs run even if one fails,
+      # giving you full visibility into which combinations are broken.
+      fail-fast: false
+      # max-parallel: limits how many matrix jobs run concurrently
+      max-parallel: 4
+      matrix:
+        node-version: ["18", "20", "22"]
+        os: ["ubuntu-latest", "windows-latest"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # CACHE: Manually cache node_modules to speed up repeated runs.
+      # The cache key uses a hash of package-lock.json so it's invalidated
+      # whenever dependencies change.
+      - name: Cache npm dependencies
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-node${{ matrix.node-version }}-
+            npm-${{ runner.os }}-
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        shell: bash
+        run: |
+          echo "Running tests on Node ${{ matrix.node-version }} / ${{ matrix.os }}"
+          npm test -- --ci --reporters=default --reporters=jest-junit || true
+
+      # ARTIFACTS: Upload test results so they can be downloaded later
+      # or used by other jobs. Each matrix job uploads to a unique path.
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        # Always upload, even if tests fail, so results are always available
+        if: always()
+        with:
+          name: test-results-node${{ matrix.node-version }}-${{ runner.os }}
+          path: |
+            coverage/
+            junit.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: security-scan
+  # Runs after lint, uses a CONTAINER image and a SERVICE (Redis).
+  # ---------------------------------------------------------------------------
+  security-scan:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    needs: [lint] # Only runs after lint succeeds
+
+    # CONTAINER: Run this job inside a Docker container instead of directly
+    # on the runner. Useful for ensuring a specific environment.
+    container:
+      image: node:20-alpine
+      env:
+        NODE_ENV: test
+
+    # SERVICES: Spin up additional containers (e.g., databases, caches)
+    # that are available to steps in this job via their service name as hostname.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        # Health check ensures Redis is ready before steps run
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Verify the Redis service is reachable from within the container
+      - name: Verify Redis connectivity
+        run: |
+          apk add --no-cache redis
+          redis-cli -h redis ping
+
+      # Run npm audit to check for known vulnerabilities
+      - name: Audit npm dependencies
+        continue-on-error: true # Don't fail the pipeline on audit warnings
+        run: |
+          echo "Running security audit..."
+          npm audit --audit-level=high || echo "::warning::Security vulnerabilities found — review audit output"
+
+      - name: Check for secrets in code
+        continue-on-error: true
+        run: |
+          echo "Scanning for hardcoded secrets..."
+          # Simple pattern check (in real projects, use tools like truffleHog or git-secrets)
+          if grep -rn "password\s*=\s*['\"][^'\"]\+['\"]" src/ 2>/dev/null; then
+            echo "::warning::Potential hardcoded password found"
+          else
+            echo "No obvious hardcoded secrets found"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # JOB 4: build
+  # Depends on both lint AND test. Produces a build artifact and sets a
+  # JOB OUTPUT (build version) that downstream jobs can consume.
+  # ---------------------------------------------------------------------------
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    needs: [lint, test] # Only runs after BOTH lint and test succeed
+
+    # JOB OUTPUTS: Values computed in this job and available to dependent jobs
+    outputs:
+      build-version: ${{ steps.version.outputs.version }}
+      artifact-name: ${{ steps.version.outputs.artifact-name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup project environment
+        uses: ./.github/actions/setup-project
+        with:
+          node-version: "20"
+          install-deps: "true"
+
+      # Compute the build version from git SHA or manual input
+      - name: Determine build version
+        id: version
+        shell: bash
+        run: |
+          # Use manual override if provided, otherwise generate from git SHA
+          if [ -n "${{ github.event.inputs.version_override }}" ]; then
+            VERSION="${{ github.event.inputs.version_override }}"
+          else
+            VERSION="1.0.0-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          ARTIFACT_NAME="app-build-${VERSION}"
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "artifact-name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+
+          # Also write to the step summary (visible in the Actions UI)
+          echo "### Build Version" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifact:** \`${ARTIFACT_NAME}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run build
+        shell: bash
+        run: |
+          echo "Building version ${{ steps.version.outputs.version }}..."
+          npm run build
+          echo "${{ steps.version.outputs.version }}" > dist/VERSION
+          echo "Build complete!"
+
+      # Upload the built artifact
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.artifact-name }}
+          path: dist/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # JOB 5: deploy-staging
+  # Deploys to staging. Only runs on the main branch.
+  # Uses an ENVIRONMENT with a URL (configured in repo settings).
+  # Downloads the build artifact from the build job.
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    # CONDITIONAL: Only deploy to staging when pushing to main
+    # For PRs and feature branches, this job is skipped.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    # ENVIRONMENT: Links this job to a GitHub Environment (configured in
+    # Settings → Environments). Environments can have protection rules,
+    # required reviewers, and deployment branch policies.
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # DOWNLOAD ARTIFACT: Retrieve the build artifact produced by the build job
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: dist/
+
+      # Demonstrate consuming a JOB OUTPUT from a dependency
+      - name: Deploy to staging
+        shell: bash
+        run: |
+          echo "=== Staging Deployment ==="
+          echo "Version: ${{ needs.build.outputs.build-version }}"
+          echo "Environment: staging"
+          echo "Triggered by: ${{ github.actor }}"
+          echo ""
+          echo "Contents of dist/:"
+          ls -la dist/
+          echo ""
+          echo "Deploying version ${{ needs.build.outputs.build-version }} to staging..."
+          # In a real workflow, this would call a deployment API or script
+          echo "Deployment to staging complete!"
+          echo "::notice::Successfully deployed ${{ needs.build.outputs.build-version }} to staging"
+
+      - name: Run smoke tests
+        shell: bash
+        continue-on-error: true
+        run: |
+          echo "Running post-deployment smoke tests..."
+          # In a real workflow, this would curl the staging URL and verify responses
+          echo "Smoke tests passed (simulated)"
+
+  # ---------------------------------------------------------------------------
+  # JOB 6: deploy-production
+  # Requires staging to succeed first. Uses a production environment with
+  # required manual approvals (configured in repo Settings → Environments).
+  # Demonstrates timeout-minutes and environment protection rules.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    # Listing both 'build' and 'deploy-staging' in needs gives this job access
+    # to outputs from both — specifically needs.build.outputs for the artifact name.
+    needs: [build, deploy-staging]
+
+    # TIMEOUT: Job fails if it takes longer than this many minutes.
+    # Prevents runaway jobs from consuming CI minutes indefinitely.
+    timeout-minutes: 30
+
+    # Production environment — in Settings → Environments, you can require
+    # specific reviewers to approve before this job runs.
+    environment:
+      name: production
+      url: https://example.com
+
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: dist/
+
+      - name: Deploy to production
+        shell: bash
+        run: |
+          echo "=== Production Deployment ==="
+          echo "Environment: production"
+          echo "Approved by: ${{ github.actor }}"
+          echo "Ref: ${{ github.ref }}"
+          echo ""
+          echo "Deploying to production..."
+          # In a real workflow, this would call your production deployment system
+          echo "Production deployment complete!"
+
+      - name: Create deployment record
+        shell: bash
+        run: |
+          # Write deployment summary to the job summary page
+          echo "### Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | production |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> $GITHUB_STEP_SUMMARY

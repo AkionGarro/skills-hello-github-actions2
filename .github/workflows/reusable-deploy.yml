@@ -1,0 +1,160 @@
+# =============================================================================
+# REUSABLE WORKFLOW: deploy
+# =============================================================================
+# This workflow demonstrates the `workflow_call` trigger, which allows other
+# workflows (callers) to invoke this workflow like a function/subroutine.
+#
+# Key concepts demonstrated:
+#   - on: workflow_call  (makes this workflow reusable)
+#   - inputs:            (typed parameters passed by the caller)
+#   - secrets:           (secrets forwarded from the calling workflow)
+#   - outputs:           (values returned to the calling workflow)
+#   - Environment usage inside reusable workflow
+#
+# HOW TO CALL THIS WORKFLOW from another workflow:
+#
+#   jobs:
+#     call-deploy:
+#       uses: ./.github/workflows/reusable-deploy.yml
+#       with:
+#         environment: staging
+#         version: "1.2.3"
+#       secrets:
+#         DEPLOY_TOKEN: ${{ secrets.MY_DEPLOY_TOKEN }}
+# =============================================================================
+
+name: Reusable Deploy Workflow
+
+on:
+  # WORKFLOW_CALL: This is what makes the workflow reusable.
+  # It cannot be triggered directly from the Actions UI.
+  workflow_call:
+
+    # INPUTS: Typed parameters that callers must/can provide
+    inputs:
+      environment:
+        description: "The deployment target environment (dev/staging/production)"
+        required: true
+        type: string
+      version:
+        description: "The version string to deploy (e.g. 1.2.3)"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, simulate the deployment without making changes"
+        required: false
+        type: boolean
+        default: false
+
+    # SECRETS: Named secrets that the caller must pass through.
+    # These are NOT automatically inherited — the caller must explicitly forward them.
+    secrets:
+      DEPLOY_TOKEN:
+        description: "Authentication token for the deployment system"
+        required: false  # Optional — deployment simulated if not provided
+
+    # OUTPUTS: Values this reusable workflow returns to the caller.
+    # These must reference outputs from specific jobs within this workflow.
+    outputs:
+      deployment-url:
+        description: "The URL of the deployed application"
+        value: ${{ jobs.deploy.outputs.url }}
+      deployment-status:
+        description: "The final status of the deployment (success/failure)"
+        value: ${{ jobs.deploy.outputs.status }}
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+  deploy:
+    name: "Deploy to ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+
+    # Use the dynamically-specified environment
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://${{ inputs.environment }}.example.com
+
+    # JOB OUTPUTS: Must be defined here to be accessible as workflow outputs
+    outputs:
+      url: ${{ steps.set-outputs.outputs.url }}
+      status: ${{ steps.set-outputs.outputs.status }}
+
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          echo "Validating deployment parameters..."
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Version: ${{ inputs.version }}"
+          echo "Dry run: ${{ inputs.dry_run }}"
+
+          # Validate environment value
+          case "${{ inputs.environment }}" in
+            dev|staging|production)
+              echo "✓ Valid environment: ${{ inputs.environment }}"
+              ;;
+            *)
+              echo "✗ Invalid environment: ${{ inputs.environment }}"
+              echo "Must be one of: dev, staging, production"
+              exit 1
+              ;;
+          esac
+
+      # Use the DEPLOY_TOKEN secret if provided
+      - name: Authenticate with deployment system
+        shell: bash
+        run: |
+          if [ -n "$DEPLOY_TOKEN" ]; then
+            echo "Authenticating with provided DEPLOY_TOKEN..."
+            echo "Authentication successful"
+          else
+            echo "No DEPLOY_TOKEN provided — using simulated deployment"
+          fi
+        env:
+          # Secrets are passed in via env to avoid logging them
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+
+      - name: Run deployment
+        id: deploy
+        shell: bash
+        run: |
+          echo "=== Deployment Details ==="
+          echo "Environment : ${{ inputs.environment }}"
+          echo "Version     : ${{ inputs.version }}"
+          echo "Dry run     : ${{ inputs.dry_run }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo ""
+
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            echo "DRY RUN — no actual deployment performed"
+            echo "Would deploy version ${{ inputs.version }} to ${{ inputs.environment }}"
+          else
+            echo "Deploying version ${{ inputs.version }} to ${{ inputs.environment }}..."
+            # Simulate deployment steps
+            sleep 2
+            echo "Deployment complete!"
+          fi
+
+      # Set the job outputs that will be returned to the caller
+      - name: Set outputs
+        id: set-outputs
+        shell: bash
+        run: |
+          DEPLOY_URL="https://${{ inputs.environment }}.example.com/v${{ inputs.version }}"
+          echo "url=${DEPLOY_URL}" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+
+          echo "### Reusable Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** ${DEPLOY_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
