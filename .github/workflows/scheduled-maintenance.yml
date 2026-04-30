@@ -1,0 +1,266 @@
+# =============================================================================
+# SCHEDULED MAINTENANCE & EVENT-DRIVEN WORKFLOW
+# =============================================================================
+# This workflow demonstrates:
+#   - schedule (cron) trigger — runs on a timed schedule
+#   - repository_dispatch — triggered by external HTTP calls (webhook)
+#   - Conditional logic based on github.event_name
+#   - Using the gh CLI to interact with GitHub (create issues, etc.)
+#   - Timeout and retry patterns with continue-on-error
+#   - Multi-step jobs with context-aware behavior
+#
+# HOW TO TRIGGER MANUALLY:
+#   Via repository_dispatch (requires PAT or GITHUB_TOKEN):
+#
+#   curl -X POST \
+#     -H "Authorization: token YOUR_GITHUB_TOKEN" \
+#     -H "Accept: application/vnd.github.v3+json" \
+#     https://api.github.com/repos/OWNER/REPO/dispatches \
+#     -d '{"event_type":"maintenance","client_payload":{"task":"cleanup"}}'
+# =============================================================================
+
+name: Scheduled Maintenance
+
+on:
+  # SCHEDULE: Cron syntax — runs at 2:00 AM UTC every Sunday
+  # Cron format: minute hour day-of-month month day-of-week
+  # Note: Scheduled workflows only run on the default branch.
+  schedule:
+    - cron: "0 2 * * 0"  # Every Sunday at 02:00 UTC
+
+  # REPOSITORY_DISPATCH: Triggered by an external system via the GitHub API.
+  # The `event_type` in the API call must match one of the values listed here.
+  # This is useful for integrating with external CI systems, scripts, or services.
+  repository_dispatch:
+    types:
+      - maintenance       # Triggered by: {"event_type": "maintenance"}
+      - cleanup           # Triggered by: {"event_type": "cleanup"}
+      - health-check      # Triggered by: {"event_type": "health-check"}
+
+  # Allow manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Which maintenance task to run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - cleanup
+          - health-check
+          - report
+
+# =============================================================================
+# PERMISSIONS
+# gh CLI needs write access to create issues and manage the repository
+# =============================================================================
+permissions:
+  contents: read
+  issues: write
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1: determine-task
+  # Figure out what triggered this run and what task to perform.
+  # ---------------------------------------------------------------------------
+  determine-task:
+    name: "Determine Task"
+    runs-on: ubuntu-latest
+    outputs:
+      task: ${{ steps.set-task.outputs.task }}
+      triggered-by: ${{ steps.set-task.outputs.triggered-by }}
+
+    steps:
+      - name: Determine task and trigger source
+        id: set-task
+        shell: bash
+        run: |
+          # CONDITIONAL LOGIC based on github.event_name
+          case "${{ github.event_name }}" in
+            "schedule")
+              TASK="all"
+              TRIGGERED_BY="cron-schedule"
+              echo "::notice::Triggered by scheduled cron job"
+              ;;
+            "repository_dispatch")
+              # Use the event_type from the dispatch payload
+              TASK="${{ github.event.action }}"
+              TRIGGERED_BY="repository-dispatch"
+              PAYLOAD='${{ toJSON(github.event.client_payload) }}'
+              echo "::notice::Triggered by repository_dispatch event: ${TASK}"
+              echo "Client payload: ${PAYLOAD}"
+              ;;
+            "workflow_dispatch")
+              TASK="${{ github.event.inputs.task }}"
+              TRIGGERED_BY="manual-dispatch"
+              echo "::notice::Triggered manually by ${{ github.actor }}"
+              ;;
+            *)
+              TASK="all"
+              TRIGGERED_BY="unknown"
+              ;;
+          esac
+
+          echo "task=${TASK}" >> $GITHUB_OUTPUT
+          echo "triggered-by=${TRIGGERED_BY}" >> $GITHUB_OUTPUT
+          echo "Selected task: ${TASK}, triggered by: ${TRIGGERED_BY}"
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: maintenance
+  # Performs the actual maintenance tasks with retry logic.
+  # ---------------------------------------------------------------------------
+  maintenance:
+    name: "Run Maintenance Tasks"
+    runs-on: ubuntu-latest
+    needs: [determine-task]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Display task info
+        shell: bash
+        run: |
+          echo "=== Maintenance Run ==="
+          echo "Task       : ${{ needs.determine-task.outputs.task }}"
+          echo "Triggered  : ${{ needs.determine-task.outputs.triggered-by }}"
+          echo "Run date   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Repository : ${{ github.repository }}"
+          echo "======================"
+
+      # RETRY PATTERN: Try the step, and if it fails, retry up to N times.
+      # This is useful for flaky network calls or external services.
+      - name: Health check (attempt 1)
+        id: health-check-1
+        continue-on-error: true # Don't fail immediately — try again
+        shell: bash
+        run: |
+          echo "Running health check (attempt 1)..."
+          # Simulate a health check that might fail
+          # In a real workflow, this might curl an API endpoint
+          curl --fail --silent --max-time 10 https://api.github.com/zen || exit 1
+          echo "Health check passed on attempt 1"
+
+      # RETRY: Only runs if the first attempt failed
+      - name: Health check (attempt 2 — retry)
+        id: health-check-2
+        if: steps.health-check-1.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Retrying health check (attempt 2)..."
+          sleep 5 # Wait before retry
+          curl --fail --silent --max-time 10 https://api.github.com/zen || exit 1
+          echo "Health check passed on attempt 2"
+
+      # RETRY: Final attempt
+      - name: Health check (attempt 3 — final retry)
+        id: health-check-3
+        if: steps.health-check-2.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Final health check attempt (attempt 3)..."
+          sleep 10
+          curl --fail --silent --max-time 10 https://api.github.com/zen || {
+            echo "::error::Health check failed after 3 attempts"
+            exit 1
+          }
+          echo "Health check passed on attempt 3"
+
+      # Cleanup task — only runs when task is 'cleanup' or 'all'
+      - name: Run cleanup
+        if: |
+          needs.determine-task.outputs.task == 'cleanup' ||
+          needs.determine-task.outputs.task == 'all'
+        shell: bash
+        run: |
+          echo "Running cleanup tasks..."
+          # Simulate cleanup operations
+          echo "  → Cleaning temp files..."
+          echo "  → Pruning old logs..."
+          echo "  → Archiving stale data..."
+          echo "Cleanup complete!"
+
+      # Generate a maintenance report
+      - name: Generate report
+        id: report
+        shell: bash
+        run: |
+          REPORT="Maintenance run completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "report=${REPORT}" >> $GITHUB_OUTPUT
+
+          echo "### Maintenance Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Task | ${{ needs.determine-task.outputs.task }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ needs.determine-task.outputs.triggered-by }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ steps.health-check-1.outcome }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: create-issue-on-failure
+  # Uses the gh CLI to automatically create a GitHub Issue if maintenance fails.
+  # ---------------------------------------------------------------------------
+  create-issue-on-failure:
+    name: "Create Issue on Failure"
+    runs-on: ubuntu-latest
+    needs: [maintenance]
+    # Only run this job if the maintenance job failed
+    if: failure()
+
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # USE gh CLI to create a GitHub issue automatically
+      # GITHUB_TOKEN is automatically available to all workflows
+      - name: Create failure issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_TITLE="🚨 Maintenance Job Failed — $(date -u +%Y-%m-%d)"
+          ISSUE_BODY=$(cat <<'EOF'
+          ## Maintenance Workflow Failure
+
+          The scheduled maintenance workflow failed.
+
+          **Details:**
+          - **Workflow:** ${{ github.workflow }}
+          - **Run ID:** ${{ github.run_id }}
+          - **Triggered by:** ${{ github.event_name }}
+          - **Branch:** ${{ github.ref_name }}
+          - **Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          **Action Required:**
+          Please review the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) and investigate the root cause.
+
+          ---
+          *This issue was automatically created by the maintenance workflow.*
+          EOF
+          )
+
+          echo "Creating GitHub issue for maintenance failure..."
+          gh issue create \
+            --title "${ISSUE_TITLE}" \
+            --body "${ISSUE_BODY}" \
+            --label "bug" \
+            --repo "${{ github.repository }}" \
+            || echo "::warning::Could not create issue — label may not exist. Continuing..."
+
+          echo "Issue creation step complete."
