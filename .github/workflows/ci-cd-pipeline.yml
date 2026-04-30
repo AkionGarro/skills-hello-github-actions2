@@ -429,7 +429,9 @@ jobs:
   deploy-production:
     name: "Deploy to Production"
     runs-on: ubuntu-latest
-    needs: [deploy-staging]
+    # Listing both 'build' and 'deploy-staging' in needs gives this job access
+    # to outputs from both — specifically needs.build.outputs for the artifact name.
+    needs: [build, deploy-staging]
 
     # TIMEOUT: Job fails if it takes longer than this many minutes.
     # Prevents runaway jobs from consuming CI minutes indefinitely.
@@ -454,10 +456,6 @@ jobs:
         with:
           name: ${{ needs.build.outputs.artifact-name }}
           path: dist/
-        # JOB OUTPUTS from non-direct dependencies require using needs.<job>.outputs
-        # Since deploy-production doesn't directly need build, we reference
-        # it through the chain. In practice, pass versions via environment vars
-        # or re-declare needs: [build, deploy-staging] to access build outputs.
 
       - name: Deploy to production
         shell: bash
